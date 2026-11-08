@@ -1,0 +1,191 @@
+name: Update Hysteria on OBS
+
+on:
+  # Releases in another repository do not emit release events here.
+  schedule:
+    - cron: '23 * * * *'
+  repository_dispatch:
+    types: [hysteria-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published stable tag (blank = latest; e.g. app/v2.13.0)'
+        type: string
+        default: ''
+      force:
+        description: 'Rebuild an already packaged version (never downgrade)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Commit to OBS after all builds succeed'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hysteria-obs-release
+  cancel-in-progress: false
+
+env:
+  OBS_PROJECT: ${{ vars.OBS_PROJECT || 'home:calad' }}
+
+jobs:
+  detect:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.release.outputs.changed }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: release
+        name: Compare the upstream release with OBS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || '' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          args=()
+          if [[ "$FORCE" == true ]]; then args+=(--force); fi
+          python3 ci/obs.py detect --tag "$RELEASE_TAG" "${args[@]}"
+      - if: steps.release.outputs.changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata
+          path: .work/release.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  prepare:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: registry.opensuse.org/opensuse/tumbleweed:latest
+    env:
+      OSC_CONFIG: /tmp/osc-ci/oscrc
+      XDG_STATE_HOME: /tmp/osc-ci/state
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap checkout tools
+        run: zypper --non-interactive --gpg-auto-import-keys install --no-recommends ca-certificates git tar gzip
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: bash ci/install.sh
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: .work
+      - name: Fetch and vendor the pinned release with OBS source services
+        run: python3 ci/obs.py prepare
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs-sources
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repository: openSUSE_Tumbleweed
+            arch: x86_64
+            runner: ubuntu-24.04
+          - repository: openSUSE_Tumbleweed
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - repository: openSUSE_Slowroll
+            arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    container:
+      image: registry.opensuse.org/opensuse/tumbleweed:latest
+      # osc's chroot builder needs mounts and a private network namespace.
+      options: --privileged
+    env:
+      OSC_CONFIG: /tmp/osc-ci/oscrc
+      XDG_STATE_HOME: /tmp/osc-ci/state
+      BUILD_REPOSITORY: ${{ matrix.repository }}
+      BUILD_ARCH: ${{ matrix.arch }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap checkout tools
+        run: zypper --non-interactive --gpg-auto-import-keys install --no-recommends ca-certificates git tar gzip
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: bash ci/install.sh
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-sources
+          path: artifacts
+      - run: python3 ci/obs.py unpack
+      - name: Resolve and download build dependencies
+        env:
+          OSC_USERNAME: ${{ vars.OBS_USERNAME }}
+          OSC_PASSWORD: ${{ secrets.OBS_PASSWORD }}
+        run: bash ci/build.sh preload "$BUILD_REPOSITORY" "$BUILD_ARCH"
+      - name: Build RPMs with osc and execute the packaged Hysteria binary
+        run: bash ci/build.sh build "$BUILD_REPOSITORY" "$BUILD_ARCH"
+      - name: Save build log and RPMs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-${{ matrix.repository }}-${{ matrix.arch }}
+          path: |
+            artifacts/build.log
+            artifacts/rpms/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Remove osc authentication state
+        if: always()
+        run: rm -rf /tmp/osc-ci
+
+  publish:
+    needs: [detect, build]
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: registry.opensuse.org/opensuse/tumbleweed:latest
+    env:
+      OSC_CONFIG: /tmp/osc-ci/oscrc
+      XDG_STATE_HOME: /tmp/osc-ci/state
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap checkout tools
+        run: zypper --non-interactive --gpg-auto-import-keys install --no-recommends ca-certificates git tar gzip
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: bash ci/install.sh
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-sources
+          path: artifacts
+      - name: Commit the tested source snapshot to OBS
+        env:
+          OSC_USERNAME: ${{ vars.OBS_USERNAME }}
+          OSC_PASSWORD: ${{ secrets.OBS_PASSWORD }}
+        run: python3 ci/obs.py publish
+      - name: Remove osc authentication state
+        if: always()
+        run: rm -rf /tmp/osc-ci

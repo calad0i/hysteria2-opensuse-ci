@@ -1,0 +1,1 @@
+# Hysteria Publishing CI for openSUSE

@@ -1,0 +1,9 @@
+<services>
+  <service name="download_files" mode="manual" />
+  <service name="go_modules" mode="manual">
+    <!-- CI replaces this glob with the exact release archive filename. -->
+    <param name="archive">v*.tar.gz</param>
+    <param name="subdir">app</param>
+    <param name="compression">gz</param>
+  </service>
+</services>
